@@ -79,28 +79,28 @@ class AModel(nn.Module):
     def __init__(self, bert_tokenizer, word_dim=768, out_dim=512):
         super(AModel, self).__init__()
         self.bert = Bert(bert_tokenizer)
-        self.ans_proj = nn.Linear(word_dim, out_dim)
+        #self.ans_proj = nn.Linear(word_dim, out_dim)
         self.que_proj = nn.Linear(word_dim, out_dim)
         
-    def forward(self, answer, ltype = 'ans'):
+    def forward(self, answer):
         if len(answer.shape) == 3:
             #multi-choice
             bs, nans, lans = answer.shape
             answer = answer.view(bs * nans, lans)
             answer, hd_state = self.bert(answer)
-            if ltype == 'ans':
-                answer = self.ans_proj(answer)
-            else:
-                answer = self.que_proj(answer)
+            #if ltype == 'ans':
+            #    answer = self.ans_proj(answer)
+            #else:
+            answer = self.que_proj(answer)
             answer_g = answer.mean(dim=1)
             # answer_g = answer[:, 0, :]
             answer_g = answer_g.view(bs, nans, -1)
         else:
             answer, hd_state = self.bert(answer)
-            if ltype == 'ans':
-                answer = self.ans_proj(answer)
-            else:
-                answer = self.que_proj(answer)
+            #if ltype == 'ans':
+            #    answer = self.ans_proj(answer)
+            #else:
+            answer = self.que_proj(answer)
             answer_g = answer.mean(dim=1)
             # answer_g = answer[:, 0, :]
         

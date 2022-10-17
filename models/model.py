@@ -8,16 +8,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import BertTokenizer
-
+from collections import OrderedDict
 from .bert import AModel
 
-from .vision_transformer import QuickGELU, Attention
+#from .vision_transformer import QuickGELU, Attention
 from .weight_loaders import weight_loader_fn_dict
 from .vision_transformer import (
     VisionTransformer2D, TransformerDecoderLayer,
     model_to_fp16, vit_presets,
 )
-        
+from .transformer import lmodel
+from .cmatt import CMAtten
 
 class TemporalCrossAttention(nn.Module):
 
@@ -122,8 +123,8 @@ class EVLDecoder(nn.Module):
     def forward(self, in_features, q_feat):
         N, T, L, C = in_features[0]['out'].size()
         assert len(in_features) == self.num_layers
-        #x = self.cls_token.view(1, 1, -1).repeat(N, 1, 1)
-        x = q_feat.unsqueeze(1)
+        x = self.cls_token.view(1, 1, -1).repeat(N, 1, 1)
+        #x = q_feat.unsqueeze(1)
 
         for i in range(self.num_layers):
             frame_features = in_features[i]['out']
@@ -197,6 +198,21 @@ class EVLTransformer(nn.Module):
 
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.l_encoder = AModel(tokenizer, out_dim=backbone_feature_dim)
+        #self.l_encoder = self._create_transformer(backbone_path)
+        self.cm_att = CMAtten()
+
+    def _create_transformer(self, backbone_path):
+        ckpt = torch.load(backbone_path)
+        state_dict = OrderedDict()
+        for k,v in ckpt.named_parameters():
+            state_dict[k] = v
+        context_length = state_dict["positional_embedding"].shape[0]
+        vocab_size = state_dict["token_embedding.weight"].shape[0]
+        transformer_width = state_dict["ln_final.weight"].shape[0]
+        transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+        model = lmodel(vocab_size, transformer_width, context_length, transformer_layers)
+        model.load_state_dict(ckpt.state_dict(), strict=False)
+        return model
     
     def _create_backbone(
         self,
@@ -227,7 +243,7 @@ class EVLTransformer(nn.Module):
     def _get_backbone(self, x):
         if isinstance(self.backbone, list):
             # freeze backbone
-            self.backbone[0] = self.backbone[0].to(x.device)
+            self.backbone[0] = self.backbone[0]
             return self.backbone[0]
         else:
             # finetune bakbone
@@ -241,11 +257,11 @@ class EVLTransformer(nn.Module):
         answer_g, answer = self.l_encoder(answer)
         return answer_g, answer 
 
-    def forward(self, x, q, text_mask):
+    def forward(self, x, q, text_mask, answer = None, q_len = None):
         
-        q_feat = self.l_encoder(q, ltype='que')[0]
+        q_feat, q = self.l_encoder(q) # q_feat
         
-        backbone = self._get_backbone(x)
+        backbone = self._get_backbone(x).to(x.device)
 
         B, C, T, H, W = x.size()
         x = x.permute(0, 2, 1, 3, 4).flatten(0, 1)
@@ -255,9 +271,17 @@ class EVLTransformer(nn.Module):
             for x in features
         ]
 
-        x = self.decoder(features, q_feat).squeeze(1)  # bs x 1 x 1024 - > bs x 1024
+        x = self.decoder(features, q_feat) # bs x 1 x 1024 - > bs x 1024
 
-        answer_g, answer = self.answer_embeddings
+        x_len = torch.ones_like(q_len)
+        qv_feat, _ = self.cm_att(x, x_len, q, q_len)
+        qv_feat = qv_feat + x
+        if answer == []:
+            answer_g, _ = self.answer_embeddings
+        else:
+            answer_g, _ =self.get_answer_embedding(answer)
+        
         answer_k = answer_g.clone().to(x.device)
         pred = x @ answer_k.t()
+        pred = pred.squeeze(1)
         return pred

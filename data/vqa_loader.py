@@ -1,3 +1,4 @@
+from lib2to3.pgen2 import token
 import sys
 sys.path.insert(0, '../')
 
@@ -10,14 +11,15 @@ import pandas as pd
 import collections
 import os
 import os.path as osp
-import h5py
+import argparse
 import random as rd
 import numpy as np
 import os.path as osp
 import cv2
-from data.preprocess import transform
+from .preprocess import transform
 from torchvision import transforms
 from .transform import create_random_augment, random_resized_crop
+from utils import tokenize
 
 class VideoQADataset(Dataset):
     def __init__(
@@ -41,7 +43,11 @@ class VideoQADataset(Dataset):
         :param max_feats: maximum frames to sample from a video
         """
         self.csv_path = csv_path
-        self.data = pd.read_csv(csv_path)
+        if args.mc:
+            self.data = pd.read_csv(csv_path,sep='\t',error_bad_lines=False)
+        else:
+            self.data = pd.read_csv(csv_path)
+        self.dset = self.csv_path.split('/')[-2]
         self.video_dir = video_dir
         self.qmax_words = qmax_words
         self.amax_words = amax_words
@@ -54,7 +60,7 @@ class VideoQADataset(Dataset):
         self.mean = torch.tensor([0.48145466, 0.4578275, 0.40821073])
         self.std = torch.tensor([0.26862954, 0.26130258, 0.27577711])
         self.num_frames = args.num_frames
-        self.sampling_rate = 16
+        self.mc = args.mc
 
     def __len__(self):
         return len(self.data)
@@ -63,46 +69,71 @@ class VideoQADataset(Dataset):
     def __getitem__(self, index):
         
         cur_sample = self.data.loc[index]
-        vid_id = cur_sample["video"]
-        vid_id = str(vid_id)
-        qid = str(cur_sample['qid'])
+        vid_id = str(cur_sample["video"])
+        #qid = str(cur_sample['qid'])
         question_txt = cur_sample['question']
-        question_embd = self.bert_tokenizer.encode(
-                question_txt,
-                add_special_tokens=True,
-                padding="longest",
-                max_length=self.qmax_words,
-                truncation=True,
-            )[:self.qmax_words]
         
-        num_pad = self.qmax_words - len(question_embd)
+        if self.qmax_words != 0:
+            question_embd = self.bert_tokenizer.encode(
+                    question_txt,
+                    add_special_tokens=True,
+                    padding="longest",
+                    max_length=self.qmax_words,
+                    truncation=True,
+                )[:self.qmax_words]
 
-        question_embd = question_embd + [0] * num_pad
-        question_embd = torch.tensor(
-            question_embd,
-            dtype=torch.long
-        )
+            seq_len = len(question_embd)
+            num_pad = self.qmax_words - len(question_embd)
 
-        type, answer = 0, 0
-
-        question_id = vid_id+'_'+qid         
+            question_embd = question_embd + [0] * num_pad
+            question_embd = torch.tensor(
+                question_embd,
+                dtype=torch.long
+            )
+        else:
+            question_embd = torch.tensor([0], dtype=torch.long)
         
-        answer_txts = cur_sample["answer"]
-        answer_id = self.a2id.get(answer_txts, -1) 
+        answer = [] 
         
-        question_id = qid
+        if self.mc:
+            answer_id = int(cur_sample["answer"])
+            answer_txts = [self.data["a" + str(i+1)][index] for i in range(self.mc)]
+            for a in answer_txts:
+                answer_embed = self.bert_tokenizer.encode(
+                    a,
+                    add_special_tokens=True,
+                    padding="longest",
+                    max_length=self.amax_words,
+                    truncation=True,
+                )[:self.amax_words]
+                num_pad = self.amax_words - len(answer_embed)
 
-        video_dir = osp.join(self.video_dir, "video" + vid_id) + '.mp4'
-        #video_paths = [osp.join(video_dir, i) for i in os.listdir(video_dir)]
-        #video_paths = sorted(video_paths)
-        container = av.open(video_dir)
-        frames = {}
-        for frame in container.decode(video=0):
-            frames[frame.pts] = frame
-        container.close()
-        frames = [frames[k] for k in sorted(frames.keys())]
-        frame_idx = self._random_sample_frame_idx(len(frames))
-        frames = [frames[x].to_rgb().to_ndarray() for x in frame_idx]
+                answer_embed = answer_embed + [0] * num_pad
+                answer_embed = torch.tensor(
+                    answer_embed,
+                    dtype=torch.long
+                )
+                answer.append(answer_embed)
+            answer = torch.stack(answer)
+        else:
+            answer_txts = cur_sample["answer"]
+            answer_id = self.a2id.get(answer_txts, -1) 
+
+        if self.dset == 'msrvtt':
+            video_dir = osp.join(self.video_dir, "video" + vid_id)
+        else:
+            video_dir = osp.join(self.video_dir, vid_id)
+        
+        video_paths = [osp.join(video_dir, i) for i in os.listdir(video_dir)]
+        video_paths = sorted(video_paths)
+        idx = np.arange(self.num_frames) * (len(video_paths) // self.num_frames)
+        interval = len(video_paths) - idx[-1]
+        
+        step = np.random.randint(0, interval)
+        step = step if self.mode == 'train' else 0
+        idx = idx + step
+        video_paths = np.array(video_paths)[idx].tolist()
+        frames = np.concatenate([np.expand_dims(cv2.imread(im),axis=0) for im in video_paths])
         frames = torch.as_tensor(np.stack(frames)).float() / 255.
 
         if self.auto_augment is not None:
@@ -127,11 +158,10 @@ class VideoQADataset(Dataset):
             "video_id": vid_id,
             "question": question_embd,
             "question_txt": question_txt,
-            "type": type,
-            "answer":0,
+            "question_length":seq_len,
+            "answer":answer,
             "answer_id": answer_id,
             "answer_txt": answer_txts,
-            "question_id": question_id,
             "images": frames
         }
     
@@ -234,7 +264,7 @@ def get_videoqa_loaders(args, a2id, bert_tokenizer, test_mode):
             shuffle=shuffle,
             drop_last=True,
             sampler = train_sampler,
-            collate_fn=videoqa_collate_fn,
+            #collate_fn=videoqa_collate_fn,
         )
         val_loader = None
         '''
@@ -259,3 +289,22 @@ def get_videoqa_loaders(args, a2id, bert_tokenizer, test_mode):
         test_loader = None
 
     return (train_loader, val_loader, test_loader)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    args = parser.parse_args()
+    args.mc = 5
+    args.num_frames = 8
+    args.batch_size = 2
+    csv_path = 'data/tgifqa/action/train.csv'
+    from transformers import BertTokenizer
+    bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    trainset =VideoQADataset(csv_path, bert_tokenizer = bert_tokenizer,video_dir="/home/qinyixin/data/dataset/MSRVTT-QA/video", args = args)
+    train_loader = DataLoader(
+            trainset,
+            batch_size=args.batch_size
+            #collate_fn=videoqa_collate_fn,
+        )
+    for batch in train_loader:
+        pass

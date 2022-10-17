@@ -3,6 +3,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 import json
 import math
+import packaging
+from simple_tokenizer import SimpleTokenizer as _Tokenizer
+
+_tokenizer = _Tokenizer()
 
 def tokenize(
     seq,
