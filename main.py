@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import argparse
 from datetime import datetime
 import builtins
@@ -13,7 +13,7 @@ from models.model import EVLTransformer
 from models.vision_transformer import vit_presets
 from models.weight_loaders import weight_loader_fn_dict
 from data.vqa_loader import get_videoqa_loaders
-from utils import compute_a2v, get_cosine_schedule_with_warmup
+from utils import compute_a2v, get_cosine_schedule_with_warmup, tokenize
 from torch.utils.tensorboard import SummaryWriter
 
 def setup_print(is_master: bool):
@@ -80,7 +80,7 @@ def main():
 
     parser.add_argument('--lr', type=float, default=1e-5,
                         help='learning rate')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='optimizer weight decay')
     parser.add_argument('--disable_fp16', action='store_false', dest='fp16',
@@ -93,6 +93,8 @@ def main():
 
     args = parser.parse_args()
 
+    args.mc = 0
+    args.dataset = 'msrvtt'
     args.clip = True
     args.cls = False
     args.distribute = False
@@ -103,7 +105,7 @@ def main():
     args.qmax_words = 20
     args.train_csv_path = "data/msrvtt/train.csv"
     args.num_thread_reader = 4
-    args.video_dir = "/home/qinyixin/data/dataset/MSRVTT-QA/video"
+    args.video_dir = "/home/qinyixin/data/MSRVTT-QA/video_frames"
 
     if args.distribute:
         dist.init_process_group('nccl')
@@ -147,19 +149,21 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[cuda_device_id], output_device=cuda_device_id,
         )
-    
     else:
-        model = torch.nn.DataParallel(model)
+        #model = torch.nn.DataParallel(model)
+        model = model
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
 
     bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    a2id, id2a, a2v = compute_a2v(
-            vocab_path=args.vocab_path,
-            bert_tokenizer=bert_tokenizer,
-            amax_words=args.amax_words,
-        )
+    
+    if args.dataset == 'msrvtt':
+        a2id, id2a, a2v = compute_a2v(
+                vocab_path=args.vocab_path,
+                bert_tokenizer=bert_tokenizer,
+                amax_words=args.amax_words,
+            )
     train_loader, val_loader, test_loader = get_videoqa_loaders(args, a2id, bert_tokenizer, False)
     scheduler = get_cosine_schedule_with_warmup(
             optimizer, 0 , len(train_loader) * args.epochs
@@ -172,17 +176,30 @@ def main():
     for epoch in range(last_epoch + 1, args.epochs):
         if args.distribute:
             train_loader.sampler.set_epoch(epoch)
-            val_loader.sampler.set_epoch(epoch)
+            #val_loader.sampler.set_epoch(epoch)
         for iter, batch in enumerate(train_loader):
             n_iter = epoch * len(train_loader) + iter
             video_frames = batch['images'].cuda()
             question = batch['question'].cuda()
+            question_txt = batch['question_txt']
+            question_len = batch['question_length']
             question_mask = (question > 0).float()
             answer_id = batch['answer_id'].cuda()
-            model.module._compute_answer_embedding(a2v)
-            predicts = model(
-                video_frames, question, question_mask
-            )
+            answer = batch['answer']
+            #answer_token = tokenize(answer).cuda()
+            if not args.mc:
+                model._compute_answer_embedding(a2v)
+                predicts = model(
+                    video_frames, question, question_mask, answer, question_len
+                )
+            else:
+                fusion_proj, answer_proj = model(
+                    video_frames,
+                    question,
+                    answer=answer_token,
+                )
+                fusion_proj = fusion_proj.unsqueeze(2)
+                predicts = torch.bmm(answer_proj, fusion_proj).squeeze()
 
             loss = criterion(predicts,answer_id)
             total_loss += loss
